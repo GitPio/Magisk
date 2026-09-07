@@ -1,11 +1,11 @@
 #pragma once
 
-#include <stdint.h>
+#include <cstdint>
 #include <utility>
 #include <bitset>
-#include <cxx.h>
+#include <rust/cxx.h>
 
-#include "format.hpp"
+enum class FileFormat : uint8_t;
 
 /******************
  * Special Headers
@@ -43,15 +43,6 @@ struct blob_hdr {
     uint32_t version;       /* 0x00000001 */
 } __attribute__((packed));
 
-struct zimage_hdr {
-    uint32_t code[9];
-    uint32_t magic;      /* zImage magic */
-    uint32_t start;      /* absolute load/run zImage address */
-    uint32_t end;        /* zImage end address */
-    uint32_t endian;     /* endianness flag */
-    // There could be more fields, but we don't care
-} __attribute__((packed));
-
 /**************
  * AVB Headers
  **************/
@@ -69,6 +60,34 @@ struct AvbFooter {
     uint64_t vbmeta_offset;
     uint64_t vbmeta_size;
     uint8_t reserved[28];
+} __attribute__((packed));
+
+// https://android.googlesource.com/platform/external/avb/+/refs/heads/android11-release/libavb/avb_descriptor.h
+enum AvbDescriptorTag : uint64_t {
+    AVB_DESCRIPTOR_TAG_PROPERTY        = 0,
+    AVB_DESCRIPTOR_TAG_HASHTREE        = 1,
+    AVB_DESCRIPTOR_TAG_HASH            = 2,
+    AVB_DESCRIPTOR_TAG_KERNEL_CMDLINE  = 3,
+    AVB_DESCRIPTOR_TAG_CHAIN_PARTITION = 4,
+};
+
+struct AvbDescriptor {
+    uint64_t tag;
+    uint64_t num_bytes_following;  // size of descriptor body (excludes this header); should always be a multiple of 8.
+} __attribute__((packed));
+
+// https://android.googlesource.com/platform/external/avb/+/refs/heads/android11-release/libavb/avb_hash_descriptor.h
+// for AvbDescriptor.tag == AVB_DESCRIPTOR_TAG_HASH
+struct AvbHashDescriptor {
+    AvbDescriptor header;
+    uint64_t image_size;
+    uint8_t hash_algorithm[32];
+    uint32_t partition_name_len;
+    uint32_t salt_len;
+    uint32_t digest_len;
+    uint32_t flags;
+    uint8_t reserved[60];
+    // followed by: partition_name, salt, digest (variable length)
 } __attribute__((packed));
 
 // https://android.googlesource.com/platform/external/avb/+/refs/heads/android11-release/libavb/avb_vbmeta_image.h
@@ -94,7 +113,47 @@ struct AvbVBMetaImageHeader {
     uint32_t rollback_index_location;
     uint8_t release_string[AVB_RELEASE_STRING_SIZE];
     uint8_t reserved[80];
+
+    struct AvbDescriptorRange descriptors();
 } __attribute__((packed));
+
+struct AvbDescriptorIterator {
+    AvbDescriptor *ptr;
+    AvbDescriptor &operator*() const { return *ptr; }
+    AvbDescriptor *operator->() const { return ptr; }
+    bool operator!=(const AvbDescriptorIterator &o) const {
+        if(ptr == nullptr) return false;
+        return ptr != o.ptr;
+    }
+    AvbDescriptorIterator &operator++() {
+        if (ptr->num_bytes_following % 8 != 0) {
+            // This is an error, a malformed image.
+            // https://android.googlesource.com/platform/external/avb/+/refs/heads/android11-release/libavb/avb_descriptor.h#60
+            // > For padding, |num_bytes_following| is always a multiple of 8.
+            // we can't signal an error easily, but we can stop the iteration.
+            ptr = nullptr;
+            return *this;
+        }
+        ptr = reinterpret_cast<AvbDescriptor *>(
+            reinterpret_cast<uint8_t *>(ptr) + sizeof(AvbDescriptor) + __builtin_bswap64(ptr->num_bytes_following));
+        return *this;
+    }
+};
+
+struct AvbDescriptorRange {
+    AvbDescriptor *first, *last;
+    AvbDescriptorIterator begin() const { return {first}; }
+    AvbDescriptorIterator end()   const { return {last}; }
+};
+
+inline AvbDescriptorRange AvbVBMetaImageHeader::descriptors() {
+    auto *base = reinterpret_cast<const uint8_t *>(this) + sizeof(AvbVBMetaImageHeader);
+    base += __builtin_bswap64(authentication_data_block_size);
+    base += __builtin_bswap64(descriptors_offset);
+    auto *first = reinterpret_cast<AvbDescriptor *>(const_cast<uint8_t *>(base));
+    auto *last  = reinterpret_cast<AvbDescriptor *>(const_cast<uint8_t *>(base) + __builtin_bswap64(descriptors_size));
+    return {first, last};
+}
 
 /*********************
  * Boot Image Headers
@@ -111,15 +170,21 @@ struct AvbVBMetaImageHeader {
 #define VENDOR_RAMDISK_NAME_SIZE 32
 #define VENDOR_RAMDISK_TABLE_ENTRY_BOARD_ID_SIZE 16
 
-/* When the boot image header has a version of 0 - 2, the structure of the boot
+#define VENDOR_RAMDISK_TYPE_NONE 0
+#define VENDOR_RAMDISK_TYPE_PLATFORM 1
+#define VENDOR_RAMDISK_TYPE_RECOVERY 2
+#define VENDOR_RAMDISK_TYPE_DLKM 3
+
+/*
+ * When the boot image header has a version of 0 - 2, the structure of the boot
  * image is as follows:
  *
  * +-----------------+
  * | boot header     | 1 page
  * +-----------------+
- * | kernel          | n pages
+ * | kernel          | m pages
  * +-----------------+
- * | ramdisk         | m pages
+ * | ramdisk         | n pages
  * +-----------------+
  * | second stage    | o pages
  * +-----------------+
@@ -130,8 +195,8 @@ struct AvbVBMetaImageHeader {
  * | dtb             | q pages
  * +-----------------+
  *
- * n = (kernel_size + page_size - 1) / page_size
- * m = (ramdisk_size + page_size - 1) / page_size
+ * m = (kernel_size + page_size - 1) / page_size
+ * n = (ramdisk_size + page_size - 1) / page_size
  * o = (second_size + page_size - 1) / page_size
  * p = (recovery_dtbo_size + page_size - 1) / page_size
  * q = (dtb_size + page_size - 1) / page_size
@@ -211,7 +276,8 @@ struct boot_img_hdr_pxa : public boot_img_hdr_v0_common {
     char extra_cmdline[BOOT_EXTRA_ARGS_SIZE];
 } __attribute__((packed));
 
-/* When the boot image header has a version of 3 - 4, the structure of the boot
+/*
+ * When the boot image header has a version of 3 - 4, the structure of the boot
  * image is as follows:
  *
  * +---------------------+
@@ -329,7 +395,7 @@ struct vendor_ramdisk_table_entry_v4 {
     uint32_t ramdisk_size;   /* size in bytes for the ramdisk image */
     uint32_t ramdisk_offset; /* offset to the ramdisk image in vendor ramdisk section */
     uint32_t ramdisk_type;   /* type of the ramdisk */
-    uint8_t ramdisk_name[VENDOR_RAMDISK_NAME_SIZE]; /* asciiz ramdisk name */
+    char ramdisk_name[VENDOR_RAMDISK_NAME_SIZE]; /* asciiz ramdisk name */
 
     // Hardware identifiers describing the board, soc or platform which this
     // ramdisk is intended to be loaded on.
@@ -339,6 +405,17 @@ struct vendor_ramdisk_table_entry_v4 {
 /*******************************
  * Polymorphic Universal Header
  *******************************/
+
+template <typename T>
+static T align_to(T v, int a) {
+    static_assert(std::is_integral_v<T>);
+    return (v + a - 1) / a * a;
+}
+
+template <typename T>
+static T align_padding(T v, int a) {
+    return align_to(v, a) - v;
+}
 
 #define decl_val(name, len) \
 virtual uint##len##_t name() const { return 0; }
@@ -376,8 +453,12 @@ struct dyn_img_hdr {
 
     // v4 specific
     decl_val(signature_size, 32)
+
+    // v4 vendor specific
     decl_val(vendor_ramdisk_table_size, 32)
-    decl_val(bootconfig_size, 32)
+    decl_val(vendor_ramdisk_table_entry_num, 32)
+    decl_val(vendor_ramdisk_table_entry_size, 32)
+    decl_var(bootconfig_size, 32)
 
     virtual ~dyn_img_hdr() {
         free(raw);
@@ -417,9 +498,11 @@ private:
 #define __impl_cls(name, hdr)           \
 protected: name() = default;            \
 public:                                 \
-name(const void *ptr) {                 \
-    raw = malloc(sizeof(hdr));          \
-    memcpy(raw, ptr, sizeof(hdr));      \
+explicit                                \
+name(const void *p, ssize_t sz = -1) {  \
+    if (sz < 0) sz = sizeof(hdr);       \
+    raw = calloc(sizeof(hdr), 1);       \
+    memcpy(raw, p, sz);                 \
 }                                       \
 size_t hdr_size() const override {      \
     return sizeof(hdr);                 \
@@ -554,7 +637,9 @@ struct dyn_img_vnd_v4 : public dyn_img_vnd_v3 {
     impl_cls(vnd_v4)
 
     impl_val(vendor_ramdisk_table_size)
-    impl_val(bootconfig_size)
+    impl_val(vendor_ramdisk_table_entry_num)
+    impl_val(vendor_ramdisk_table_entry_size)
+    impl_var(bootconfig_size)
 };
 
 #undef __impl_cls
@@ -586,20 +671,22 @@ enum {
     BOOT_FLAGS_MAX
 };
 
+struct ZImage;
+
 struct boot_img {
     // Memory map of the whole image
     const mmap_data map;
 
     // Android image header
-    const dyn_img_hdr *hdr;
+    dyn_img_hdr *hdr = nullptr;
 
     // Flags to indicate the state of current boot image
     std::bitset<BOOT_FLAGS_MAX> flags;
 
     // The format of kernel, ramdisk and extra
-    format_t k_fmt = UNKNOWN;
-    format_t r_fmt = UNKNOWN;
-    format_t e_fmt = UNKNOWN;
+    FileFormat k_fmt;
+    FileFormat r_fmt;
+    FileFormat e_fmt;
 
     /*************************************************************
      * Following pointers points within the read-only mmap region
@@ -607,9 +694,9 @@ struct boot_img {
 
     // Layout of the memory mapped region
     // +---------+
-    // | head    | Vendor specific. Should be empty for standard AOSP boot images.
+    // | head    | Vendor specific. Should not exist for standard AOSP boot images.
     // +---------+
-    // | payload | The actual boot image, including the AOSP boot image header.
+    // | payload | The actual entire AOSP boot image, including the boot image header.
     // +---------+
     // | tail    | Data after payload. Usually contains signature/AVB information.
     // +---------+
@@ -618,49 +705,43 @@ struct boot_img {
     byte_view tail;
 
     // MTK headers
-    const mtk_hdr *k_hdr;
-    const mtk_hdr *r_hdr;
+    const mtk_hdr *k_hdr = nullptr;
+    const mtk_hdr *r_hdr = nullptr;
 
-    // The pointers/values after parse_image
-    // +---------------+
-    // | z_hdr         | z_info.hdr_sz
-    // +---------------+
-    // | kernel        | hdr->kernel_size()
-    // +---------------+
-    // | z_info.tail   | z_info.tail.sz()
-    // +---------------+
-    const zimage_hdr *z_hdr;
-    struct {
-        uint32_t hdr_sz;
-        byte_view tail;
-    } z_info;
+    std::unique_ptr<ZImage> z_info;
 
     // AVB structs
-    const AvbFooter *avb_footer;
-    const AvbVBMetaImageHeader *vbmeta;
+    const AvbFooter *avb_footer = nullptr;
+    const AvbVBMetaImageHeader *vbmeta = nullptr;
 
     // Pointers to blocks defined in header
-    const uint8_t *kernel;
-    const uint8_t *ramdisk;
-    const uint8_t *second;
-    const uint8_t *extra;
-    const uint8_t *recovery_dtbo;
-    const uint8_t *dtb;
+    const uint8_t *kernel = nullptr;
+    const uint8_t *ramdisk = nullptr;
+    const uint8_t *second = nullptr;
+    const uint8_t *extra = nullptr;
+    const uint8_t *recovery_dtbo = nullptr;
+    const uint8_t *dtb = nullptr;
+    const uint8_t *signature = nullptr;
+    const uint8_t *vendor_ramdisk_table = nullptr;
+    const uint8_t *bootconfig = nullptr;
 
     // dtb embedded in kernel
     byte_view kernel_dtb;
 
-    // Blocks defined in header but we do not care
-    byte_view ignore;
-
-    boot_img(const char *);
+    explicit boot_img(const char *);
     ~boot_img();
 
-    bool parse_image(const uint8_t *addr, format_t type);
-    const std::pair<const uint8_t *, dyn_img_hdr *> create_hdr(const uint8_t *addr, format_t type);
+    bool parse_image(const uint8_t *addr, FileFormat type);
+    const uint8_t *parse_hdr(const uint8_t *addr, FileFormat type);
+    std::span<const vendor_ramdisk_table_entry_v4> vendor_ramdisk_tbl() const;
 
     // Rust FFI
+    static std::unique_ptr<boot_img> create(Utf8CStr name) { return std::make_unique<boot_img>(name.c_str()); }
     rust::Slice<const uint8_t> get_payload() const { return payload; }
     rust::Slice<const uint8_t> get_tail() const { return tail; }
-    bool verify(const char *cert = nullptr) const;
+    bool is_signed() const { return flags[AVB1_SIGNED_FLAG]; }
+    uint64_t tail_off() const { return tail.data() - map.data(); }
+
+    // Implemented in Rust
+    bool verify() const noexcept;
 };

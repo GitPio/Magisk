@@ -44,8 +44,8 @@ Let's continue to [Patching Images](#patching-images).
 - Flash the patched boot/init_boot/recovery image to your device;<br>
   for most devices, reboot into fastboot mode and flash with command:<br>
   `fastboot flash boot /path/to/magisk_patched_[random_strings].img` or <br>
-  `fastboot flash init_boot /path/to/magisk_patched.img_[random_strings]` or <br>
-  `fastboot flash recovery /path/to/magisk_patched.img_[random_strings]`, <br>
+  `fastboot flash init_boot /path/to/magisk_patched_[random_strings].img` or <br>
+  `fastboot flash recovery /path/to/magisk_patched_[random_strings].img` <br>
 - (Optional) If your device has a separate `vbmeta` partition, you can patch the `vbmeta` partition with command:<br>
   `fastboot flash vbmeta --disable-verity --disable-verification vbmeta.img` (note that it may **wipe your data**)
 - Reboot and launch Magisk app (you will see a stub Magisk app if you have wiped your data; use it to bootstrap to a complete Magisk app), and you will see a prompt asking for environment fix; click and wait for the reboot
@@ -76,7 +76,7 @@ As a summary, after installing Magisk in recovery **(starting from power off)**:
 Before proceeding, please acknowledge that:
 
 - Installing Magisk **WILL** trip your Knox Warranty Bit, this action is not reversible in any way.
-- Installing Magisk for the first time **REQUIRES** a full data wipe (this is **NOT** counting the data wipe when unlocking bootloader). Please make a backup your data.
+- Installing Magisk for the first time **REQUIRES** a full data wipe (this is **NOT** counting the data wipe when unlocking bootloader). Please make a backup of your data.
 
 ### Flashing Tools
 
@@ -86,7 +86,7 @@ Before proceeding, please acknowledge that:
 
 ### Requirements
 
-To verify whether or not Magisk can be installed in your Samsung device, you first must check the OEM Lock and KnoxGuard (RMM) status, to do so boot your device in Download mode with its key combo.
+To verify whether or not Magisk can be installed in your Samsung device, you first must check the OEM Lock and KnoxGuard (RMM) status. To do so, go to `Settings` -> `Device Care` -> `Maintenance Mode` and enable it, then boot your device in Download mode with its key combo.
 
 Possible OEM Lock values are the following:
 - **ON (L)**: fully locked.

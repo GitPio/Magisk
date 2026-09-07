@@ -41,7 +41,9 @@ Supported actions:
 
   repack [-n] <origbootimg> [outbootimg]
     Repack boot image components using files from the current directory
-    to [outbootimg], or 'new-boot.img' if not specified.
+    to [outbootimg], or 'new-boot.img' if not specified. Current directory
+    should only contain required files for [outbootimg], or incorrect
+    [outbootimg] may be produced.
     <origbootimg> is the original boot image used to unpack the components.
     By default, each component will be automatically compressed using its
     corresponding format detected in <origbootimg>. If a component file
@@ -136,14 +138,14 @@ Supported actions:
     If [format] is not specified, then gzip will be used.
     If [outfile] is not specified, then <infile> will be replaced
     with another file suffixed with a matching file extension.
-    Supported formats: gzip zopfli xz lzma bzip2 lz4 lz4_legacy lz4_lg 
+    Supported formats: gzip xz lzma bzip2 lz4 lz4_legacy lz4_lg
 
   decompress <infile> [outfile]
     Detect format and decompress <infile> to [outfile].
     <infile>/[outfile] can be '-' to be STDIN/STDOUT.
     If [outfile] is not specified, then <infile> will be replaced
     with another file removing its archive format file extension.
-    Supported formats: gzip zopfli xz lzma bzip2 lz4 lz4_legacy lz4_lg 
+    Supported formats: gzip xz lzma bzip2 lz4 lz4_legacy lz4_lg
 ```
 
 ### magiskinit

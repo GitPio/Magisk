@@ -1,277 +1,227 @@
-use std::path::{Path, PathBuf};
-use std::ptr;
-
-use num_traits::AsPrimitive;
-
-use base::libc::{c_uint, dev_t};
-use base::{
-    cstr, debug, info, libc, parse_mount_info, raw_cstr, warn, FsPath, FsPathBuf, LibcReturn,
-    LoggedResult, ResultExt, Utf8CStr, Utf8CStrBufArr,
-};
-
 use crate::consts::{MODULEMNT, MODULEROOT, PREINITDEV, PREINITMIRR, WORKERDIR};
 use crate::ffi::{get_magisk_tmp, resolve_preinit_dir, switch_mnt_ns};
-use crate::get_prop;
+use crate::resetprop::get_prop;
+use base::{
+    FsPathBuilder, LibcReturn, LoggedResult, MountInfo, ResultExt, Utf8CStr, Utf8CStrBuf, cstr,
+    debug, info, libc, parse_mount_info, warn,
+};
+use libc::{c_uint, dev_t, major};
+use nix::mount::MsFlags;
+use nix::sys::stat::{Mode, SFlag, mknod};
+use num_traits::AsPrimitive;
+use std::cmp::Ordering::{Greater, Less};
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
-pub fn setup_mounts() {
-    info!("* Setup internal mounts");
+// Linux allocated devices: 240-254 are reserved for LOCAL/EXPERIMENTAL use.
+const DYNAMIC_MAJOR_MIN: u32 = 240;
+const DYNAMIC_MAJOR_MAX: u32 = 254;
 
+pub fn setup_preinit_dir() {
     let magisk_tmp = get_magisk_tmp();
-    let mut buf = Utf8CStrBufArr::default();
 
     // Mount preinit directory
-    let mut dev_buf = Utf8CStrBufArr::<64>::new();
-    let dev_path = FsPathBuf::new(&mut dev_buf)
-        .join(magisk_tmp)
-        .join(PREINITDEV);
-    let mut mounted = false;
-    if let Ok(attr) = dev_path.get_attr() {
-        if attr.st.st_mode & libc::S_IFMT as c_uint == libc::S_IFBLK.as_() {
-            // DO NOT mount the block device directly, as we do not know the flags and configs
-            // to properly mount the partition; mounting block devices directly as rw could cause
-            // crashes if the filesystem driver is crap (e.g. some broken F2FS drivers).
-            // What we do instead is to scan through the current mountinfo and find a pre-existing
-            // mount point mounting our desired partition, and then bind mount the target folder.
-            let preinit_dev = attr.st.st_rdev;
-            let mnt_path = FsPathBuf::new(&mut buf).join(magisk_tmp).join(PREINITMIRR);
-            for info in parse_mount_info("self") {
-                if info.root == "/" && info.device == preinit_dev {
-                    if !info.fs_option.split(',').any(|s| s == "rw") {
-                        // Only care about rw mounts
-                        continue;
-                    }
-                    let mut target = info.target;
-                    let target = Utf8CStr::from_string(&mut target);
-                    let mut preinit_dir = resolve_preinit_dir(target);
-                    let preinit_dir = Utf8CStr::from_string(&mut preinit_dir);
-                    let r: LoggedResult<()> = try {
-                        FsPath::from(preinit_dir).mkdir(0o700)?;
-                        mnt_path.mkdirs(0o755)?;
-                        unsafe {
-                            libc::mount(
-                                preinit_dir.as_ptr(),
-                                mnt_path.as_ptr(),
-                                ptr::null(),
-                                libc::MS_BIND,
-                                ptr::null(),
-                            )
-                            .as_os_err()?
-                        }
-                    };
-                    if r.is_ok() {
-                        mounted = true;
-                        break;
-                    }
+    let dev_path = cstr::buf::new::<64>()
+        .join_path(magisk_tmp)
+        .join_path(PREINITDEV);
+    if let Ok(attr) = dev_path.get_attr()
+        && attr.st.st_mode & libc::S_IFMT as c_uint == libc::S_IFBLK.as_()
+    {
+        // DO NOT mount the block device directly, as we do not know the flags and configs
+        // to properly mount the partition; mounting block devices directly as rw could cause
+        // crashes if the filesystem driver is crap (e.g. some broken F2FS drivers).
+        // What we do instead is to scan through the current mountinfo and find a pre-existing
+        // mount point mounting our desired partition, and then bind mount the target folder.
+        let preinit_dev = attr.st.st_rdev;
+        let mnt_path = cstr::buf::default()
+            .join_path(magisk_tmp)
+            .join_path(PREINITMIRR);
+        for info in parse_mount_info("self") {
+            if info.root == "/" && info.device == preinit_dev {
+                if !info.fs_option.split(',').any(|s| s == "rw") {
+                    // Only care about rw mounts
+                    continue;
+                }
+                let mut target = info.target;
+                let target = Utf8CStr::from_string(&mut target);
+                let mut preinit_dir = resolve_preinit_dir(target);
+                let preinit_dir = Utf8CStr::from_string(&mut preinit_dir);
+                let r = || -> LoggedResult<()> {
+                    preinit_dir.mkdir(0o700)?;
+                    mnt_path.mkdirs(0o755)?;
+                    mnt_path.remove().ok();
+                    mnt_path.create_symlink_to(preinit_dir)?;
+                    Ok(())
+                }();
+                if r.is_ok() {
+                    info!("* Found preinit dir: {}", preinit_dir);
+                    return;
                 }
             }
         }
     }
-    if !mounted {
-        warn!("mount: preinit mirror not mounted");
-        dev_path.remove().ok();
-    } else {
-        debug!("mount: preinit mirror mounted");
-    }
 
-    // Bind remount module root to clear nosuid
-    let module_mnt = FsPathBuf::new(&mut buf).join(magisk_tmp).join(MODULEMNT);
-    let _: LoggedResult<()> = try {
-        module_mnt.mkdir(0o755)?;
-        unsafe {
-            libc::mount(
-                raw_cstr!(MODULEROOT),
-                module_mnt.as_ptr(),
-                ptr::null(),
-                libc::MS_BIND,
-                ptr::null(),
-            )
-            .as_os_err()?;
-            libc::mount(
-                ptr::null(),
-                module_mnt.as_ptr(),
-                ptr::null(),
-                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
-                ptr::null(),
-            )
-            .as_os_err()?;
-            libc::mount(
-                ptr::null(),
-                module_mnt.as_ptr(),
-                ptr::null(),
-                libc::MS_PRIVATE,
-                ptr::null(),
-            )
-            .as_os_err()?;
-        }
-    };
-
-    // Prepare worker
-    let worker_dir = FsPathBuf::new(&mut buf).join(magisk_tmp).join(WORKERDIR);
-    let _: LoggedResult<()> = try {
-        worker_dir.mkdir(0)?;
-        unsafe {
-            libc::mount(
-                worker_dir.as_ptr(),
-                worker_dir.as_ptr(),
-                ptr::null(),
-                libc::MS_BIND,
-                ptr::null(),
-            )
-            .as_os_err()?;
-            libc::mount(
-                ptr::null(),
-                worker_dir.as_ptr(),
-                ptr::null(),
-                libc::MS_PRIVATE,
-                ptr::null(),
-            )
-            .as_os_err()?;
-        }
-    };
+    warn!("mount: preinit dir not found");
 }
 
-#[derive(Ord, PartialOrd, Eq, PartialEq)]
+pub fn setup_module_mount() {
+    // Bind remount module root to clear nosuid
+    let module_mnt = cstr::buf::default()
+        .join_path(get_magisk_tmp())
+        .join_path(MODULEMNT);
+    let _ = || -> LoggedResult<()> {
+        module_mnt.mkdir(0o755)?;
+        cstr!(MODULEROOT).bind_mount_to(&module_mnt, false)?;
+        module_mnt.remount_mount_point_flags(MsFlags::MS_RDONLY)?;
+        Ok(())
+    }();
+}
+
+pub fn clean_mounts() {
+    let magisk_tmp = get_magisk_tmp();
+
+    let mut buf = cstr::buf::default();
+
+    let module_mnt = buf.append_path(magisk_tmp).append_path(MODULEMNT);
+    module_mnt.unmount().log_ok();
+    buf.clear();
+
+    let worker_dir = buf.append_path(magisk_tmp).append_path(WORKERDIR);
+    let _ = || -> LoggedResult<()> {
+        worker_dir.set_mount_private(true)?;
+        worker_dir.unmount()?;
+        Ok(())
+    }();
+}
+
+// when partitions have the same fs type, the order is:
+// - data: it has sufficient space and can be safely written
+// - cache: size is limited, but still can be safely written
+// - klogdump: available on some Smartisan devices and can be safely written
+// - metadata: size is limited, and it might cause unexpected behavior if written
+// - persist: it's the last resort, as it's dangerous to write to it
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum PartId {
-    Unknown,
-    Persist,
-    Metadata,
-    Cache,
     Data,
+    Cache,
+    Klogdump,
+    Metadata,
+    Persist,
+}
+
+enum EncryptType {
+    None,
+    Block,
+    File,
+    Metadata,
 }
 
 pub fn find_preinit_device() -> String {
-    let encrypted = get_prop(cstr!("ro.crypto.state"), false) == "encrypted";
-    let mount = unsafe { libc::getuid() } == 0 && std::env::var("MAGISKTMP").is_ok();
-    let make_dev = mount && std::env::var_os("MAKEDEV").is_some();
+    let encrypt_type = if get_prop(cstr!("ro.crypto.state")) != "encrypted" {
+        EncryptType::None
+    } else if get_prop(cstr!("ro.crypto.type")) == "block" {
+        EncryptType::Block
+    } else if get_prop(cstr!("ro.crypto.metadata.enabled")) == "true" {
+        EncryptType::Metadata
+    } else {
+        EncryptType::File
+    };
 
-    let mut ext4_type = PartId::Unknown;
-    let mut f2fs_type = PartId::Unknown;
-
-    let mut preinit_source: String = String::new();
-    let mut preinit_dir: String = String::new();
-    let mut preinit_dev: u64 = 0;
-
-    'info_loop: for info in parse_mount_info("self") {
-        if info.target.ends_with(PREINITMIRR) {
-            return Path::new(&info.source)
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-        }
-        if info.root != "/" || !info.source.starts_with('/') || info.source.contains("/dm-") {
-            continue;
-        }
-        if ext4_type != PartId::Unknown && info.fs_type != "ext4" {
-            // Skip all non ext4 partitions once we found a matching ext4 partition
-            continue;
-        }
-        if info.fs_type != "ext4" && info.fs_type != "f2fs" {
-            // Only care about ext4 and f2fs filesystems
-            continue;
-        }
-        if !info.fs_option.split(',').any(|s| s == "rw") {
-            // Only care about rw mounts
-            continue;
-        }
-        if let Some(path) = Path::new(&info.source).parent() {
+    let mut matched_info = parse_mount_info("self")
+        .into_iter()
+        .filter_map(|info| {
+            if info.root != "/" || !info.source.starts_with('/') || info.source.contains("/dm-") {
+                return None;
+            }
+            match info.fs_type.as_str() {
+                "ext4" | "f2fs" => (),
+                _ => return None,
+            }
+            if !info.fs_option.split(',').any(|s| s == "rw") {
+                return None;
+            }
+            let path = Path::new(&info.source).parent()?;
             if !path.ends_with("by-name") && !path.ends_with("block") {
-                continue;
+                return None;
             }
-        } else {
-            continue;
-        }
-
-        let matched_type = if info.fs_type == "f2fs" {
-            &mut f2fs_type
-        } else {
-            &mut ext4_type
-        };
-
-        'block: {
-            if *matched_type <= PartId::Unknown
-                && (info.target == "/persist" || info.target == "/mnt/vendor/persist")
+            // use device major number to filter out device-mapper
+            let maj = major(info.device as dev_t) as u32;
+            if (DYNAMIC_MAJOR_MIN..=DYNAMIC_MAJOR_MAX).contains(&maj)
+                && !info.source.contains("/vd")
+                && !info.source.contains("/by-name/")
             {
-                *matched_type = PartId::Persist;
-                break 'block;
+                return None;
             }
-            if *matched_type <= PartId::Persist && info.target == "/metadata" {
-                *matched_type = PartId::Metadata;
-                break 'block;
+            // take data iff it's not encrypted or file-based encrypted without metadata
+            // other partitions are always taken
+            match info.target.as_str() {
+                "/persist" | "/mnt/vendor/persist" => Some((PartId::Persist, info)),
+                "/metadata" => Some((PartId::Metadata, info)),
+                "/klogdump" => Some((PartId::Klogdump, info)),
+                "/cache" => Some((PartId::Cache, info)),
+                "/data" => Some((PartId::Data, info))
+                    .take_if(|_| matches!(encrypt_type, EncryptType::None | EncryptType::File)),
+                _ => None,
             }
-            if *matched_type <= PartId::Metadata && info.target == "/cache" {
-                *matched_type = PartId::Cache;
-                break 'block;
-            }
-            if *matched_type <= PartId::Cache
-                && info.target == "/data"
-                && (!encrypted || FsPath::from(cstr!("/data/unencrypted")).exists())
-            {
-                *matched_type = PartId::Data;
-            }
+        })
+        .collect::<Vec<_>>();
 
-            // No matches, continue through the loop
-            continue 'info_loop;
-        }
-
-        if mount {
-            let mut target = info.target;
-            preinit_dir = resolve_preinit_dir(Utf8CStr::from_string(&mut target));
-            preinit_dev = info.device;
-        }
-        preinit_source = info.source;
-
-        // Cannot find any better partition, stop finding
-        if ext4_type == PartId::Data {
-            break;
-        }
-    }
-
-    if preinit_source.is_empty() {
+    if matched_info.is_empty() {
         return String::new();
     }
 
-    if !preinit_dir.is_empty() {
-        if let Ok(tmp) = std::env::var("MAGISKTMP") {
-            let mut buf = Utf8CStrBufArr::default();
-            let mirror_dir = FsPathBuf::new(&mut buf).join(&tmp).join(PREINITMIRR);
-            let preinit_dir = FsPath::from(Utf8CStr::from_string(&mut preinit_dir));
-            let _: LoggedResult<()> = try {
-                preinit_dir.mkdirs(0o700)?;
-                mirror_dir.mkdirs(0o700)?;
-                unsafe {
-                    libc::mount(
-                        preinit_dir.as_ptr(),
-                        mirror_dir.as_ptr(),
-                        ptr::null(),
-                        libc::MS_BIND,
-                        ptr::null(),
-                    )
-                    .as_os_err()?;
-                }
-            };
-            if make_dev {
-                let dev_path = FsPathBuf::new(&mut buf).join(&tmp).join(PREINITDEV);
-                unsafe {
-                    libc::mknod(
-                        dev_path.as_ptr(),
-                        libc::S_IFBLK | 0o600,
-                        preinit_dev as dev_t,
-                    )
-                    .as_os_err()
-                    .log()
-                    .ok();
-                }
-            }
+    let (_, preinit_info, _) = matched_info.select_nth_unstable_by(
+        0,
+        |(ap, MountInfo { fs_type: at, .. }), (bp, MountInfo { fs_type: bt, .. })| match (
+            ap,
+            bp,
+            at.as_str() == "ext4",
+            bt.as_str() == "ext4",
+        ) {
+            // metadata is not affected by f2fs kernel bug
+            (PartId::Metadata, _, _, true) | (_, PartId::Metadata, true, _) => ap.cmp(bp),
+            // otherwise, take ext4 f2fs because f2fs has a kernel bug that causes kernel panic
+            (_, _, true, false) => Less,
+            (_, _, false, true) => Greater,
+            // if both has the same fs type, compare the mount point
+            _ => ap.cmp(bp),
+        },
+    );
+    let info = &preinit_info.1;
+    let mut target = info.target.clone();
+    let mut preinit_dir = resolve_preinit_dir(Utf8CStr::from_string(&mut target));
+    if unsafe { libc::getuid() } == 0
+        && let Ok(tmp) = std::env::var("MAGISKTMP")
+        && !tmp.is_empty()
+    {
+        let mut buf = cstr::buf::default();
+        let mirror_dir = buf.append_path(&tmp).append_path(PREINITMIRR);
+        let preinit_dir = Utf8CStr::from_string(&mut preinit_dir);
+        let _ = || -> LoggedResult<()> {
+            preinit_dir.mkdirs(0o700)?;
+            mirror_dir.mkdirs(0o755)?;
+            mirror_dir.unmount().ok();
+            mirror_dir.remove().ok();
+            mirror_dir.create_symlink_to(preinit_dir)?;
+            Ok(())
+        }();
+        if std::env::var_os("MAKEDEV").is_some() {
+            buf.clear();
+            let dev_path = buf.append_path(&tmp).append_path(PREINITDEV);
+            mknod(
+                dev_path.as_utf8_cstr(),
+                SFlag::S_IFBLK,
+                Mode::from_bits_truncate(0o600),
+                info.device as dev_t,
+            )
+            .check_os_err("mknod", Some(dev_path), None)
+            .log_ok();
         }
     }
-
-    Path::new(&preinit_source)
+    Path::new(&info.source)
         .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
         .to_string()
 }
 
@@ -299,10 +249,10 @@ pub fn revert_unmount(pid: i32) {
     let mut prev: Option<PathBuf> = None;
     targets.sort();
     targets.retain(|target| {
-        if let Some(prev) = &prev {
-            if Path::new(target).starts_with(prev) {
-                return false;
-            }
+        if let Some(prev) = &prev
+            && Path::new(target).starts_with(prev)
+        {
+            return false;
         }
         prev = Some(PathBuf::from(target.clone()));
         true
@@ -310,10 +260,8 @@ pub fn revert_unmount(pid: i32) {
 
     for mut target in targets {
         let target = Utf8CStr::from_string(&mut target);
-        unsafe {
-            if libc::umount2(target.as_ptr(), libc::MNT_DETACH) == 0 {
-                debug!("denylist: Unmounted ({})", target);
-            }
+        if target.unmount().is_ok() {
+            debug!("denylist: Unmounted ({})", target);
         }
     }
 }
