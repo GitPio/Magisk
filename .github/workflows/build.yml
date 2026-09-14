@@ -1,4 +1,4 @@
-Wersja.974168159.0-release: Magisk Build
+name: Magisk Build
 
 on:
   push:
